@@ -99,6 +99,46 @@ def find_bdf_files(root_dir: str, unit_case_ids: List[str]) -> Dict[str, Optiona
     return result
 
 
+def find_bdf_files_by_type(
+    combinations: "Combinations",
+    structural_root: str,
+    thermal_root: str,
+) -> Dict[str, Optional[str]]:
+    """
+    Kombinasyonlardaki unit case ID'lerini tipine göre farklı köklerde arar.
+
+    THERMALCASE içeren tipler → thermal_root
+    Diğer tüm tipler          → structural_root
+    """
+    structural_ids: List[str] = []
+    thermal_ids: List[str] = []
+    seen: set = set()
+
+    for entries in combinations.values():
+        for type_name, case_id, _ in entries:
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            if _is_thermal(type_name):
+                thermal_ids.append(case_id)
+            else:
+                structural_ids.append(case_id)
+
+    bdf_map: Dict[str, Optional[str]] = {}
+
+    if structural_ids:
+        bdf_map.update(find_bdf_files(structural_root, structural_ids))
+
+    if thermal_ids:
+        if not thermal_root:
+            for cid in thermal_ids:
+                bdf_map[cid] = None
+        else:
+            bdf_map.update(find_bdf_files(thermal_root, thermal_ids))
+
+    return bdf_map
+
+
 # ---------------------------------------------------------------------------
 # Excel ayrıştırıcılar
 # ---------------------------------------------------------------------------
@@ -619,7 +659,8 @@ def write_combination_bdf(
 
 def print_report(
     excel_path: str,
-    bdf_root: str,
+    structural_root: str,
+    thermal_root: str,
     output_path: str,
     solver: str,
     combinations: Combinations,
@@ -634,12 +675,13 @@ def print_report(
     print("\n" + "=" * 62)
     print("  Combination BDF Builder – Rapor")
     print("=" * 62)
-    print(f"  Excel       : {excel_path}")
-    print(f"  BDF kök     : {bdf_root}")
-    print(f"  Çıktı       : {output_path}")
-    print(f"  Solver      : {solver_label}")
-    print(f"  Kombinasyon : {combos_written}")
-    print(f"  Unit case   : {found} / {total} bulundu")
+    print(f"  Excel            : {excel_path}")
+    print(f"  Structural kök   : {structural_root}")
+    print(f"  Thermal kök      : {thermal_root or '(yapısal kökle aynı)'}")
+    print(f"  Çıktı            : {output_path}")
+    print(f"  Solver           : {solver_label}")
+    print(f"  Kombinasyon      : {combos_written}")
+    print(f"  Unit case        : {found} / {total} bulundu")
 
     if missing:
         print(f"\n  [!] {len(missing)} BDF dosyası BULUNAMADI:")
@@ -671,9 +713,10 @@ def run_gui():
     pad = {"padx": 6, "pady": 3}
 
     # ── Değişkenler ──────────────────────────────────────────────────────────
-    var_excel    = tk.StringVar()
-    var_bdf_root = tk.StringVar()
-    var_output   = tk.StringVar()
+    var_excel           = tk.StringVar()
+    var_structural_root = tk.StringVar()
+    var_thermal_root    = tk.StringVar()
+    var_output          = tk.StringVar()
     var_solver   = tk.StringVar(value="nx")
     var_fmt      = tk.StringVar(value="paired")
     var_sheet    = tk.StringVar(value="0")
@@ -706,10 +749,15 @@ def run_gui():
         if p:
             var_excel.set(p)
 
-    def browse_root():
-        p = filedialog.askdirectory(title="BDF Kök Dizinini Seç")
+    def browse_structural():
+        p = filedialog.askdirectory(title="Structural BDF Kök Dizinini Seç")
         if p:
-            var_bdf_root.set(p)
+            var_structural_root.set(p)
+
+    def browse_thermal():
+        p = filedialog.askdirectory(title="Thermal BDF Kök Dizinini Seç")
+        if p:
+            var_thermal_root.set(p)
 
     def browse_output():
         p = filedialog.asksaveasfilename(
@@ -727,7 +775,8 @@ def run_gui():
 
     r = 0
     r = _row(main, "Kombinasyon Excel:", var_excel, browse_excel, r)
-    r = _row(main, "Unit BDF Kök Dizin:", var_bdf_root, browse_root, r)
+    r = _row(main, "Structural BDF Kök Dizin:", var_structural_root, browse_structural, r)
+    r = _row(main, "Thermal BDF Kök Dizin:", var_thermal_root, browse_thermal, r)
     r = _row(main, "Çıktı BDF Dosyası:", var_output, browse_output, r)
 
     # Solver
@@ -779,13 +828,14 @@ def run_gui():
     # Çalıştır
     def run():
         log.configure(state="normal"); log.delete("1.0", "end"); log.configure(state="disabled")
-        excel   = var_excel.get().strip()
-        bdf_root = var_bdf_root.get().strip()
-        output  = var_output.get().strip()
-        solver  = var_solver.get()
+        excel           = var_excel.get().strip()
+        structural_root = var_structural_root.get().strip()
+        thermal_root    = var_thermal_root.get().strip()
+        output          = var_output.get().strip()
+        solver          = var_solver.get()
 
-        if not excel or not bdf_root or not output:
-            messagebox.showerror("Hata", "Excel, BDF kök dizini ve çıktı yolu zorunludur.")
+        if not excel or not structural_root or not output:
+            messagebox.showerror("Hata", "Excel, Structural BDF dizini ve çıktı yolu zorunludur.")
             return
 
         sheet_raw = var_sheet.get().strip()
@@ -812,13 +862,17 @@ def run_gui():
             )
             _log(f"  → {len(combs)} kombinasyon yüklendi.")
 
-            unique_ids = sorted({cid for entries in combs.values() for _, cid, _ in entries})
-            _log(f"  → {len(unique_ids)} benzersiz unit case ID'si bulundu.")
-
             _log("BDF dosyaları aranıyor…")
-            bdf_map = find_bdf_files(bdf_root, unique_ids)
+            _log(f"  Structural kök: {structural_root}")
+            if thermal_root:
+                _log(f"  Thermal kök   : {thermal_root}")
+            else:
+                _log("  Thermal kök   : (belirtilmedi – structural kök kullanılacak)")
+
+            eff_thermal = thermal_root or structural_root
+            bdf_map = find_bdf_files_by_type(combs, structural_root, eff_thermal)
             found = sum(1 for v in bdf_map.values() if v)
-            _log(f"  → {found} / {len(unique_ids)} BDF bulundu.")
+            _log(f"  → {found} / {len(bdf_map)} BDF bulundu.")
 
             _log(f"Çıktı BDF yazılıyor ({solver.upper()})…")
             n, missing = write_combination_bdf(
@@ -858,9 +912,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--gui", action="store_true", help="Grafik arayüzü aç")
-    p.add_argument("--excel",    help="Kombinasyon Excel dosyası yolu")
-    p.add_argument("--bdf-root", help="Unit case BDF dosyalarının kök dizini")
-    p.add_argument("--output",   help="Çıktı BDF dosyası yolu")
+    p.add_argument("--excel",           help="Kombinasyon Excel dosyası yolu")
+    p.add_argument("--structural-root", help="Structural (mekanik) BDF dosyalarının kök dizini")
+    p.add_argument("--thermal-root",    help="Thermal BDF dosyalarının kök dizini (belirtilmezse --structural-root kullanılır)")
+    p.add_argument("--bdf-root",        help="Her iki tip için tek kök dizin (geriye uyumluluk; --structural-root önceliklidir)")
+    p.add_argument("--output",          help="Çıktı BDF dosyası yolu")
     p.add_argument(
         "--solver", choices=["nx", "msc"], default="nx",
         help="Nastran solver: 'nx' (LOAD kart, varsayılan) veya 'msc' (SUBCOM/SUBSEQ)",
@@ -891,10 +947,14 @@ def main():
         run_gui()
         return
 
+    # Kök dizin çözümlemesi: --structural-root > --bdf-root
+    structural_root = args.structural_root or args.bdf_root
+    thermal_root    = args.thermal_root or args.bdf_root
+
     errors = []
-    if not args.excel:    errors.append("--excel gerekli")
-    if not args.bdf_root: errors.append("--bdf-root gerekli")
-    if not args.output:   errors.append("--output gerekli")
+    if not args.excel:       errors.append("--excel gerekli")
+    if not structural_root:  errors.append("--structural-root (veya --bdf-root) gerekli")
+    if not args.output:      errors.append("--output gerekli")
     if errors:
         for e in errors:
             print(f"[HATA] {e}", file=sys.stderr)
@@ -914,14 +974,12 @@ def main():
     )
     print(f"  → {len(combinations)} kombinasyon yüklendi.")
 
-    unique_ids = sorted({cid for entries in combinations.values() for _, cid, _ in entries})
-    preview = unique_ids[:8]
-    print(f"  → {len(unique_ids)} unique unit case ID: {preview}{'…' if len(unique_ids) > 8 else ''}")
-
-    print(f"\nBDF dosyaları aranıyor: {args.bdf_root}")
-    bdf_map = find_bdf_files(args.bdf_root, unique_ids)
+    print(f"\nBDF dosyaları aranıyor…")
+    print(f"  Structural kök : {structural_root}")
+    print(f"  Thermal kök    : {thermal_root or '(structural kök kullanılıyor)'}")
+    bdf_map = find_bdf_files_by_type(combinations, structural_root, thermal_root or structural_root)
     found = sum(1 for v in bdf_map.values() if v)
-    print(f"  → {found} / {len(unique_ids)} bulundu.")
+    print(f"  → {found} / {len(bdf_map)} bulundu.")
 
     solver_label = "MSC Nastran (SUBCOM/SUBSEQ)" if args.solver == "msc" else "NX Nastran (LOAD kart)"
     print(f"\nÇıktı BDF yazılıyor [{solver_label}]: {args.output}")
@@ -932,7 +990,7 @@ def main():
     )
 
     print_report(
-        args.excel, args.bdf_root, args.output,
+        args.excel, structural_root, thermal_root, args.output,
         args.solver, combinations, bdf_map, missing, combos_written,
     )
 
