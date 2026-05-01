@@ -2,29 +2,34 @@
 """
 Combination BDF Builder
 -----------------------
-Reads a load combination Excel file, recursively finds unit case BDF files
-under a given root directory, and writes a single output BDF that references
-them via INCLUDE statements together with LOAD combination cards.
+Gerçek Excel formatını okur, unit case BDF dosyalarını bulur ve
+solver tipine göre (MSC/NX Nastran) birleşik bir BDF dosyası üretir.
 
-Excel formats supported
-  Wide  : First column = combination name/ID, remaining column headers = unit
-          case IDs, cell values = scale factors (0 or empty → skip).
-  Long  : Three columns: combination name, unit case ID, scale factor.
+Excel formatı – Paired Columns (varsayılan)
+  Sütun A : Combined Load Case SID (çıktı BDF'teki subcase/combo SID'i)
+  Kalan   : (TIP_ID, Multiplier) sütun çiftleri
+  Örnek başlık: Combined Load Case | MAINCASE ID | Multiplier | THERMALCASE ID | Multiplier | ...
 
-Usage (CLI)
+MSC Nastran çıktısı (--solver msc)
+  Her unique unit case → ayrı SUBCASE
+  Her kombinasyon     → SUBCOM + SUBSEQ (result-level superposition)
+
+NX Nastran çıktısı (--solver nx)
+  Her kombinasyon     → tek SUBCASE + LOAD bulk kart (load-level combination)
+  THERMALCASE         → TEMP(LOAD) Case Control komutu ile eklenir
+
+Kullanım (CLI)
   python combination_bdf_builder.py \\
-      --excel  combinations.xlsx \\
-      --bdf-root /path/to/unit/cases \\
+      --excel  kombinasyonlar.xlsx \\
+      --bdf-root /birim/case/dizini \\
       --output  combined.bdf \\
-      [--format wide|long] \\
-      [--sheet  0] \\
-      [--combo-col  "Combo"] \\
-      [--case-col   "UnitCase"] \\
-      [--factor-col "Factor"] \\
+      --solver  nx|msc \\
+      [--format paired|wide|long] \\
+      [--sheet 0] \\
       [--relative-paths] \\
       [--combo-filter COMBO1 COMBO2 ...]
 
-Usage (GUI)
+Kullanım (GUI)
   python combination_bdf_builder.py --gui
 """
 
@@ -37,34 +42,40 @@ from typing import Dict, List, Optional, Tuple
 try:
     import pandas as pd
 except ImportError:
-    sys.exit("pandas is required. Run: pip install pandas openpyxl")
+    sys.exit("pandas gerekli. Kur: pip install pandas openpyxl")
+
+# ---------------------------------------------------------------------------
+# Tip tanımlamaları
+# ---------------------------------------------------------------------------
+
+# (tip_adı, unit_case_id, katsayı)
+CaseEntry = Tuple[str, str, float]
+# {combo_sid_str: [CaseEntry, ...]}
+Combinations = Dict[str, List[CaseEntry]]
+
+_THERMAL_KEYWORD = "THERMAL"  # tip adında bu kelime varsa → termal yük
 
 
 # ---------------------------------------------------------------------------
-# BDF file discovery
+# BDF dosyası arama
 # ---------------------------------------------------------------------------
 
 def find_bdf_files(root_dir: str, unit_case_ids: List[str]) -> Dict[str, Optional[str]]:
     """
-    Recursively search *root_dir* for BDF files whose stem (filename without
-    extension) contains a unit case ID string.
+    *root_dir* altında .bdf uzantılı dosyaları özyinelemeli arar.
+    Her unit case ID için eşleşen dosyayı döndürür.
 
-    Matching priority
-      1. Exact stem match (case-insensitive)
-      2. Stem contains the ID as a substring (case-insensitive)
-         - If multiple files match, the one with the shortest stem wins.
-
-    Returns {case_id: absolute_path_or_None}.
+    Eşleşme önceliği
+      1. Dosya steminin (uzantısız adı) tam eşleşmesi (büyük/küçük harf duyarsız)
+      2. Stem içinde ID'yi barındıran dosyalar → stem en kısa olanı seç
     """
     root = Path(root_dir)
     if not root.is_dir():
-        raise NotADirectoryError(f"BDF root directory not found: {root_dir}")
+        raise NotADirectoryError(f"BDF kök dizini bulunamadı: {root_dir}")
 
-    # Index all .bdf files once
     stem_to_path: Dict[str, str] = {}
     for bdf_file in root.rglob("*.bdf"):
         stem_lower = bdf_file.stem.lower()
-        # Keep the first occurrence when two files share an identical lower-case stem
         if stem_lower not in stem_to_path:
             stem_to_path[stem_lower] = str(bdf_file.resolve())
 
@@ -74,19 +85,13 @@ def find_bdf_files(root_dir: str, unit_case_ids: List[str]) -> Dict[str, Optiona
         key_lower = key.lower()
         found: Optional[str] = None
 
-        # 1. Exact stem match
         if key_lower in stem_to_path:
             found = stem_to_path[key_lower]
         else:
-            # 2. Substring match
-            matches = [
-                path for stem, path in stem_to_path.items()
-                if key_lower in stem
-            ]
+            matches = [p for s, p in stem_to_path.items() if key_lower in s]
             if len(matches) == 1:
                 found = matches[0]
             elif len(matches) > 1:
-                # Prefer shortest stem (most specific / least decorated name)
                 found = min(matches, key=lambda p: len(Path(p).stem))
 
         result[key] = found
@@ -95,35 +100,105 @@ def find_bdf_files(root_dir: str, unit_case_ids: List[str]) -> Dict[str, Optiona
 
 
 # ---------------------------------------------------------------------------
-# Excel parsing
+# Excel ayrıştırıcılar
 # ---------------------------------------------------------------------------
 
-def parse_excel_wide(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+def _cell_to_case_id(raw) -> Optional[str]:
+    """Ham Excel hücre değerini case ID string'ine dönüştür; boşsa None."""
+    if raw is None:
+        return None
+    if pd.isna(raw):
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None
+    # 12001.0 → "12001"
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+        return s
+    except ValueError:
+        return s
+
+
+def _extract_type_name(header: str) -> str:
+    """'MAINCASE ID' → 'MAINCASE',  'THERMALCASE ID' → 'THERMALCASE'"""
+    name = header.strip()
+    if name.upper().endswith(" ID"):
+        name = name[:-3].strip()
+    return name.upper()
+
+
+def parse_excel_paired_columns(df: pd.DataFrame) -> Combinations:
     """
-    Wide format
-      Column 0        → combination name
-      Column 1..N     → unit case IDs (headers)
-      Cell value      → scale factor (0 or blank → excluded)
+    Paired-column (eşli sütun) formatını ayrıştırır.
+
+    Sütun 0: Combined Load Case SID
+    Kalan sütunlar soldan sağa taranır:
+      - Başlık "multiplier" içeriyorsa → önceki ID sütununun katsayı sütunu
+      - Aksi hâlde → yeni tip ID sütunu (başlıktan tip adı çıkarılır)
     """
-    combinations: Dict[str, Dict[str, float]] = {}
+    combo_col = df.columns[0]
+
+    # (tip_adı, id_sütun_indeksi, katsayı_sütun_indeksi) üçlülerini bul
+    pairs: List[Tuple[str, int, int]] = []
+    pending: Optional[Tuple[str, int]] = None  # (tip_adı, sütun_indeksi)
+
+    for i, header in enumerate(df.columns[1:], start=1):
+        if "multiplier" in str(header).lower():
+            if pending is not None:
+                pairs.append((pending[0], pending[1], i))
+                pending = None
+        else:
+            pending = (_extract_type_name(str(header)), i)
+
+    combinations: Combinations = {}
+    for _, row in df.iterrows():
+        combo_sid = _cell_to_case_id(row[combo_col])
+        if combo_sid is None:
+            continue
+
+        entries: List[CaseEntry] = []
+        for type_name, id_idx, mult_idx in pairs:
+            case_id = _cell_to_case_id(row[df.columns[id_idx]])
+            if case_id is None:
+                continue
+            try:
+                factor = float(row[df.columns[mult_idx]])
+            except (ValueError, TypeError):
+                factor = 1.0
+            entries.append((type_name, case_id, factor))
+
+        if entries:
+            combinations[combo_sid] = entries
+
+    return combinations
+
+
+def parse_excel_wide(df: pd.DataFrame) -> Combinations:
+    """
+    Geniş format (geriye dönük uyumluluk).
+    Sütun 0: kombinasyon adı, kalan sütun başlıkları: unit case ID'ler, değerler: katsayılar.
+    """
     combo_col = df.columns[0]
     unit_cols = df.columns[1:]
+    combinations: Combinations = {}
 
     for _, row in df.iterrows():
         combo_name = str(row[combo_col]).strip()
         if not combo_name or combo_name.lower() == "nan":
             continue
-        cases: Dict[str, float] = {}
+        entries: List[CaseEntry] = []
         for col in unit_cols:
-            raw = row[col]
             try:
-                factor = float(raw)
+                factor = float(row[col])
             except (ValueError, TypeError):
                 continue
             if factor != 0.0:
-                cases[str(col).strip()] = factor
-        if cases:
-            combinations[combo_name] = cases
+                entries.append(("LOAD", str(col).strip(), factor))
+        if entries:
+            combinations[combo_name] = entries
 
     return combinations
 
@@ -133,11 +208,12 @@ def parse_excel_long(
     combo_col: str,
     case_col: str,
     factor_col: str,
-) -> Dict[str, Dict[str, float]]:
+) -> Combinations:
     """
-    Long format: each row is (combination_name, unit_case_id, scale_factor).
+    Uzun format (geriye dönük uyumluluk).
+    Her satır: (kombinasyon_adı, unit_case_id, katsayı).
     """
-    combinations: Dict[str, Dict[str, float]] = {}
+    combinations: Combinations = {}
     for _, row in df.iterrows():
         combo_name = str(row[combo_col]).strip()
         case_id = str(row[case_col]).strip()
@@ -149,207 +225,197 @@ def parse_excel_long(
             continue
         if factor == 0.0:
             continue
-        combinations.setdefault(combo_name, {})[case_id] = factor
-
+        combinations.setdefault(combo_name, []).append(("LOAD", case_id, factor))
     return combinations
 
 
 def load_combinations(
     excel_path: str,
-    fmt: str = "wide",
+    fmt: str = "paired",
     sheet=0,
     combo_col: str = "",
     case_col: str = "",
     factor_col: str = "",
-) -> Dict[str, Dict[str, float]]:
-    """Load and parse the Excel combination file."""
+) -> Combinations:
+    """Excel kombinasyon dosyasını okuyup ayrıştırır."""
     df = pd.read_excel(excel_path, sheet_name=sheet, header=0)
-    # Drop fully-empty rows/columns
     df = df.dropna(how="all").reset_index(drop=True)
     df.columns = [str(c).strip() for c in df.columns]
 
-    if fmt == "wide":
+    if fmt == "paired":
+        return parse_excel_paired_columns(df)
+    elif fmt == "wide":
         return parse_excel_wide(df)
     elif fmt == "long":
-        missing = [c for c in [combo_col, case_col, factor_col] if not c]
-        if missing:
-            raise ValueError(
-                "Long format requires --combo-col, --case-col, --factor-col."
-            )
         for col in [combo_col, case_col, factor_col]:
+            if not col:
+                raise ValueError("Long format --combo-col, --case-col, --factor-col gerektirir.")
             if col not in df.columns:
                 raise ValueError(
-                    f"Column '{col}' not found in Excel. "
-                    f"Available: {list(df.columns)}"
+                    f"Sütun '{col}' Excel'de bulunamadı. Mevcut: {list(df.columns)}"
                 )
         return parse_excel_long(df, combo_col, case_col, factor_col)
     else:
-        raise ValueError(f"Unknown format: {fmt!r}. Use 'wide' or 'long'.")
+        raise ValueError(f"Bilinmeyen format: {fmt!r}. 'paired', 'wide' veya 'long' kullanın.")
 
 
 # ---------------------------------------------------------------------------
-# BDF writer
+# BDF yazma yardımcıları
 # ---------------------------------------------------------------------------
 
-_BDF_LINE_WIDTH = 72  # Nastran free-field / comment width
+_FW = 8  # Nastran small-field genişliği
 
 
-def _nastran_load_card(sid: int, cases: Dict[str, float], case_sid_map: Dict[str, int]) -> List[str]:
-    """
-    Build LOAD bulk data card lines for a combination.
-    LOAD SID S  S1 L1 S2 L2 ... (8 fields per continuation line).
-
-    Only includes unit cases that appear in case_sid_map.
-    Returns empty list if no cases are available.
-    """
-    pairs = [
-        (factor, case_sid_map[cid])
-        for cid, factor in cases.items()
-        if cid in case_sid_map
-    ]
-    if not pairs:
-        return []
-
-    # Nastran small-field: 8 characters each field, 10 fields per line
-    # LOAD    SID     S       S1      L1      S2      L2      S3      L3
-    # Field widths: 8 chars each
-    all_fields = []
-    for factor, load_sid in pairs:
-        all_fields.append(f"{factor:8g}")
-        all_fields.append(f"{load_sid:8d}")
-
-    lines = []
-    # First line: LOAD + SID + overall_scale (1.0) + up to 3 pairs (6 fields)
-    chunk_size = 6  # S1 L1 S2 L2 S3 L3
-    first_chunk = all_fields[:chunk_size]
-    rest = all_fields[chunk_size:]
-    line = f"{'LOAD':<8}{sid:8d}{'1.0':>8}" + "".join(first_chunk)
-    lines.append(line.rstrip() + "\n")
-
-    while rest:
-        chunk = rest[:8]
-        rest = rest[8:]
-        line = "+" + " " * 7 + "".join(chunk)
-        lines.append(line.rstrip() + "\n")
-
-    return lines
+def _f8i(val: int) -> str:
+    return f"{val:>{_FW}d}"
 
 
-def write_combination_bdf(
+def _f8f(val: float) -> str:
+    s = f"{val:g}"
+    if len(s) > _FW:
+        s = f"{val:.5g}"
+    return f"{s:>{_FW}}"
+
+
+def _include_path(abs_path: str, use_relative: bool, output_dir: Path) -> str:
+    if use_relative:
+        try:
+            return os.path.relpath(abs_path, output_dir)
+        except ValueError:
+            return abs_path
+    return abs_path
+
+
+def _is_thermal(type_name: str) -> bool:
+    return _THERMAL_KEYWORD in type_name.upper()
+
+
+# ---------------------------------------------------------------------------
+# MSC Nastran BDF yazıcı (SUBCOM / SUBSEQ)
+# ---------------------------------------------------------------------------
+
+def write_bdf_msc(
     output_path: str,
-    combinations: Dict[str, Dict[str, float]],
+    combinations: Combinations,
     bdf_map: Dict[str, Optional[str]],
     use_relative_paths: bool = False,
     combo_filter: Optional[List[str]] = None,
-    start_load_sid: int = 10000,
+    start_subcase_sid: int = 1,
 ) -> Tuple[int, List[str]]:
     """
-    Write the output BDF file.
+    MSC Nastran: result-level superposition.
 
-    Structure
-      SOL 101  (placeholder – user should adjust to their solution)
-      CEND
-        SUBCASE per combination with LOAD = <auto-SID>
-      BEGIN BULK
-        INCLUDE statements for all unique unit case BDF files
-        LOAD cards for each combination
-      ENDDATA
-
-    Returns (combos_written, missing_case_ids).
+    Yapı
+      • Her unique unit case → ayrı SUBCASE
+          - Termal case: TEMP(LOAD) = <case_id>
+          - Diğerleri  : LOAD = <case_id>
+      • Her kombinasyon → SUBCOM + SUBSEQ
+          - SUBSEQ: tüm SUBCASE sırasına göre katsayı listesi (kullanılmayan → 0.0)
+      • BEGIN BULK: INCLUDE satırları
     """
     output_dir = Path(output_path).parent
     missing: List[str] = []
 
     if combo_filter:
-        filter_set = {c.strip() for c in combo_filter}
-        combinations = {k: v for k, v in combinations.items() if k in filter_set}
+        fs = {c.strip() for c in combo_filter}
+        combinations = {k: v for k, v in combinations.items() if k in fs}
 
-    # Assign a unique SID to each unit case found
-    unique_cases: List[str] = sorted(
-        {cid for cases in combinations.values() for cid in cases}
-    )
-    unit_sid_map: Dict[str, int] = {}  # case_id → assumed SID inside unit BDF
+    # Benzersiz unit case'leri sırayla topla: (tip, case_id) → subcase_id
+    unit_sc: Dict[Tuple[str, str], int] = {}
+    ordered_units: List[Tuple[str, str]] = []
+    for entries in combinations.values():
+        for type_name, case_id, _ in entries:
+            key = (type_name, case_id)
+            if key not in unit_sc:
+                unit_sc[key] = start_subcase_sid + len(unit_sc)
+                ordered_units.append(key)
 
-    # Collect BDF paths that were actually found
-    found_case_ids = [cid for cid in unique_cases if bdf_map.get(cid)]
-    not_found = [cid for cid in unique_cases if not bdf_map.get(cid)]
-    missing.extend(not_found)
+    for _, case_id in ordered_units:
+        if not bdf_map.get(case_id) and case_id not in missing:
+            missing.append(case_id)
 
-    def _include_path(abs_path: str) -> str:
-        if use_relative_paths:
-            try:
-                return os.path.relpath(abs_path, output_dir)
-            except ValueError:
-                return abs_path
-        return abs_path
-
-    # Assign auto SIDs for combinations (used in CASE CONTROL and LOAD cards).
-    # We cannot know the SIDs inside the unit case BDFs without parsing them,
-    # so we skip LOAD card generation by default and rely on pure INCLUDE.
-    # A comment block documents each combination's scale factors.
-    combo_sids: Dict[str, int] = {
-        name: start_load_sid + i
-        for i, name in enumerate(combinations)
-    }
-
-    # ---- Build the file ----
     lines: List[str] = []
 
     def c(text: str = ""):
         lines.append(f"$ {text}\n" if text else "$\n")
 
-    c("=" * (_BDF_LINE_WIDTH - 2))
-    c("  Combination Load Case BDF")
-    c("  Generated by: combination_bdf_builder.py")
-    c("=" * (_BDF_LINE_WIDTH - 2))
+    # ── Başlık ──────────────────────────────────────────────────────────────
+    c("=" * 70)
+    c("  Combination BDF  –  MSC Nastran (SUBCOM/SUBSEQ)")
+    c("  Üretildi: combination_bdf_builder.py")
+    c("=" * 70)
+    c()
+    c("VARSAYIM: Her unit case BDF dosyasındaki yük seti SID'i = unit case ID'sidir.")
+    c("  (Örn. 12001.bdf dosyası SID=12001 ile tanımlanmış FORCE/MOMENT/PLOAD içerir.)")
     c()
     lines.append("SOL 101\n")
     lines.append("CEND\n")
     c()
-    c("CASE CONTROL")
-    c()
 
-    for combo_name, cases in combinations.items():
-        sid = combo_sids[combo_name]
-        c(f"  Combination : {combo_name}")
-        for cid, factor in cases.items():
-            status = "OK" if bdf_map.get(cid) else "NOT FOUND"
-            c(f"    {cid:>12}  x {factor:g}  [{status}]")
-        lines.append(f"SUBCASE {sid}\n")
-        lines.append(f"  LABEL = {combo_name}\n")
-        lines.append(f"$ LOAD = {sid}  $ Uncomment after verifying load SIDs\n")
+    # ── Unit Case SUBCASEs ───────────────────────────────────────────────────
+    c("-" * 70)
+    c("  Unit Case SUBCASEs")
+    c("-" * 70)
+    c()
+    for (type_name, case_id), sc_id in unit_sc.items():
+        try:
+            cid_int = int(case_id)
+        except ValueError:
+            cid_int = case_id
+        lines.append(f"SUBCASE {sc_id}\n")
+        lines.append(f"  LABEL = {type_name}_{case_id}\n")
+        if _is_thermal(type_name):
+            lines.append(f"  TEMP(LOAD) = {cid_int}\n")
+        else:
+            lines.append(f"  LOAD = {cid_int}\n")
         c()
 
+    # ── Combination SUBCOMs ─────────────────────────────────────────────────
+    c("-" * 70)
+    c("  Combination SUBCOMs")
+    c("-" * 70)
+    c()
+    for combo_sid, entries in combinations.items():
+        factor_map: Dict[Tuple[str, str], float] = {
+            (t, cid): f for t, cid, f in entries
+        }
+        seq_vals = [factor_map.get(key, 0.0) for key in ordered_units]
+        seq_strs = [f"{v:g}" for v in seq_vals]
+
+        lines.append(f"SUBCOM {combo_sid}\n")
+        lines.append(f"  LABEL = {combo_sid}\n")
+
+        # SUBSEQ satırı – 72 karakter sınırı, virgüllü devam
+        prefix = "  SUBSEQ = "
+        cont   = "           "
+        cur = prefix
+        first = True
+        for sv in seq_strs:
+            candidate = cur + ("" if first else ", ") + sv
+            if len(candidate) > 72 and not first:
+                lines.append(cur + ",\n")
+                cur = cont + sv
+            else:
+                cur = candidate
+            first = False
+        lines.append(cur + "\n")
+        c()
+
+    # ── BEGIN BULK ───────────────────────────────────────────────────────────
     lines.append("BEGIN BULK\n")
     c()
-    c("-" * (_BDF_LINE_WIDTH - 2))
-    c("  INCLUDE statements for unit case BDF files")
-    c("-" * (_BDF_LINE_WIDTH - 2))
+    c("-" * 70)
+    c("  INCLUDE – Unit Case BDF Dosyaları")
+    c("-" * 70)
     c()
-
-    for cid in unique_cases:
-        bdf_path = bdf_map.get(cid)
+    for type_name, case_id in ordered_units:
+        bdf_path = bdf_map.get(case_id)
         if bdf_path:
-            ip = _include_path(bdf_path)
-            c(f"Unit Case: {cid}")
+            ip = _include_path(bdf_path, use_relative_paths, output_dir)
+            c(f"[{type_name}] Case ID: {case_id}")
             lines.append(f"INCLUDE '{ip}'\n")
         else:
-            c(f"WARNING: BDF file NOT FOUND for unit case: {cid}")
-        c()
-
-    c()
-    c("-" * (_BDF_LINE_WIDTH - 2))
-    c("  Combination scale-factor reference (informational)")
-    c("  To activate LOAD cards you must know the SID of each")
-    c("  unit case and uncomment the LOAD entries below.")
-    c("-" * (_BDF_LINE_WIDTH - 2))
-    c()
-
-    for combo_name, cases in combinations.items():
-        sid = combo_sids[combo_name]
-        c(f"Combination : {combo_name}  (SID={sid})")
-        for cid, factor in cases.items():
-            c(f"  LOAD {sid}  1.0  {factor:g}  <SID of {cid}>")
+            c(f"WARNING: BDF bulunamadı  [{type_name}] Case ID: {case_id}")
         c()
 
     lines.append("ENDDATA\n")
@@ -361,41 +427,230 @@ def write_combination_bdf(
 
 
 # ---------------------------------------------------------------------------
-# Reporting
+# NX Nastran BDF yazıcı (LOAD bulk kart)
+# ---------------------------------------------------------------------------
+
+def write_bdf_nx(
+    output_path: str,
+    combinations: Combinations,
+    bdf_map: Dict[str, Optional[str]],
+    use_relative_paths: bool = False,
+    combo_filter: Optional[List[str]] = None,
+) -> Tuple[int, List[str]]:
+    """
+    NX Nastran: load-level combination.
+
+    Yapı
+      • Case Control: her kombinasyon için tek SUBCASE
+          - Mekanik case'ler: LOAD = <combo_sid>
+          - İlk termal case : TEMP(LOAD) = <termal_case_id>
+      • BEGIN BULK:
+          - Tüm unique unit case'ler için INCLUDE
+          - Her kombinasyon için LOAD bulk kart (yalnızca mekanik case'ler)
+
+    LOAD kart formatı (Nastran small-field, 8 karakter/alan):
+      LOAD    SID     S       S1      L1      S2      L2      S3      L3
+      +               S4      L4      ...
+    """
+    output_dir = Path(output_path).parent
+    missing: List[str] = []
+
+    if combo_filter:
+        fs = {c.strip() for c in combo_filter}
+        combinations = {k: v for k, v in combinations.items() if k in fs}
+
+    # Benzersiz unit case'ler: case_id → ilk görülen tip
+    unique_cases: Dict[str, str] = {}
+    for entries in combinations.values():
+        for type_name, case_id, _ in entries:
+            if case_id not in unique_cases:
+                unique_cases[case_id] = type_name
+
+    for case_id in unique_cases:
+        if not bdf_map.get(case_id) and case_id not in missing:
+            missing.append(case_id)
+
+    lines: List[str] = []
+
+    def c(text: str = ""):
+        lines.append(f"$ {text}\n" if text else "$\n")
+
+    # ── Başlık ──────────────────────────────────────────────────────────────
+    c("=" * 70)
+    c("  Combination BDF  –  NX Nastran (LOAD kart kombinasyonu)")
+    c("  Üretildi: combination_bdf_builder.py")
+    c("=" * 70)
+    c()
+    c("VARSAYIM: Her unit case BDF dosyasındaki yük seti SID'i = unit case ID'sidir.")
+    c("  (Örn. 12001.bdf dosyası SID=12001 ile tanımlanmış FORCE/MOMENT/PLOAD içerir.)")
+    c()
+    lines.append("SOL 101\n")
+    lines.append("CEND\n")
+    c()
+
+    # ── Case Control ─────────────────────────────────────────────────────────
+    c("-" * 70)
+    c("  Combination SUBCASEs")
+    c("-" * 70)
+    c()
+    for combo_sid, entries in combinations.items():
+        mech = [(t, cid, f) for t, cid, f in entries if not _is_thermal(t)]
+        therm = [(t, cid, f) for t, cid, f in entries if _is_thermal(t)]
+
+        try:
+            sid_int = int(combo_sid)
+        except ValueError:
+            sid_int = combo_sid
+
+        lines.append(f"SUBCASE {sid_int}\n")
+        lines.append(f"  LABEL = {combo_sid}\n")
+        if mech:
+            lines.append(f"  LOAD = {sid_int}\n")
+        if therm:
+            t_sid = therm[0][1]
+            try:
+                t_sid_int = int(t_sid)
+            except ValueError:
+                t_sid_int = t_sid
+            lines.append(f"  TEMP(LOAD) = {t_sid_int}\n")
+            if len(therm) > 1:
+                c(f"  UYARI: Birden fazla termal case var; yalnızca ilki ({t_sid}) TEMP(LOAD) olarak eklendi.")
+        c()
+
+    # ── BEGIN BULK ───────────────────────────────────────────────────────────
+    lines.append("BEGIN BULK\n")
+    c()
+    c("-" * 70)
+    c("  INCLUDE – Unit Case BDF Dosyaları")
+    c("-" * 70)
+    c()
+    for case_id, type_name in unique_cases.items():
+        bdf_path = bdf_map.get(case_id)
+        if bdf_path:
+            ip = _include_path(bdf_path, use_relative_paths, output_dir)
+            c(f"[{type_name}] Case ID: {case_id}")
+            lines.append(f"INCLUDE '{ip}'\n")
+        else:
+            c(f"WARNING: BDF bulunamadı  [{type_name}] Case ID: {case_id}")
+        c()
+
+    # ── LOAD kartları ────────────────────────────────────────────────────────
+    c()
+    c("-" * 70)
+    c("  LOAD Kart Kombinasyonları (yalnızca mekanik case'ler)")
+    c("-" * 70)
+    c()
+    for combo_sid, entries in combinations.items():
+        mech = [(t, cid, f) for t, cid, f in entries if not _is_thermal(t)]
+        if not mech:
+            continue
+
+        try:
+            sid_int = int(combo_sid)
+        except ValueError:
+            sid_int = 0
+
+        c(f"Kombinasyon: {combo_sid}")
+        for t, cid, f in mech:
+            c(f"  [{t}] {cid} x {f:g}")
+
+        # Scale-load çiftlerini oluştur
+        pair_fields: List[str] = []
+        for _, case_id, factor in mech:
+            try:
+                cid_int = int(case_id)
+            except ValueError:
+                cid_int = 0
+            pair_fields.append(_f8f(factor))
+            pair_fields.append(_f8i(cid_int))
+
+        # Satır 1: LOAD + SID + S(=1.0) + ilk 3 çift (6 alan)
+        line1_data = pair_fields[:6]
+        line1 = f"{'LOAD':<{_FW}}{_f8i(sid_int)}{_f8f(1.0)}" + "".join(line1_data)
+        lines.append(line1.rstrip() + "\n")
+
+        # Devam satırları: her satırda 4 çift (8 alan)
+        rest = pair_fields[6:]
+        while rest:
+            chunk = rest[:8]
+            rest = rest[8:]
+            cont = f"{'+':<{_FW}}{'':>{_FW}}" + "".join(chunk)
+            lines.append(cont.rstrip() + "\n")
+
+        c()
+
+    lines.append("ENDDATA\n")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    return len(combinations), missing
+
+
+# ---------------------------------------------------------------------------
+# Yönlendirici
+# ---------------------------------------------------------------------------
+
+def write_combination_bdf(
+    output_path: str,
+    combinations: Combinations,
+    bdf_map: Dict[str, Optional[str]],
+    solver: str = "nx",
+    use_relative_paths: bool = False,
+    combo_filter: Optional[List[str]] = None,
+    start_subcase_sid: int = 1,
+) -> Tuple[int, List[str]]:
+    """Seçilen solver'a göre MSC veya NX BDF yazıcısına yönlendirir."""
+    if solver == "msc":
+        return write_bdf_msc(
+            output_path, combinations, bdf_map,
+            use_relative_paths, combo_filter, start_subcase_sid,
+        )
+    else:
+        return write_bdf_nx(
+            output_path, combinations, bdf_map,
+            use_relative_paths, combo_filter,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rapor
 # ---------------------------------------------------------------------------
 
 def print_report(
     excel_path: str,
     bdf_root: str,
     output_path: str,
-    combinations: Dict[str, Dict[str, float]],
+    solver: str,
+    combinations: Combinations,
     bdf_map: Dict[str, Optional[str]],
     missing: List[str],
     combos_written: int,
 ):
-    total_cases = len(bdf_map)
-    found_cases = sum(1 for v in bdf_map.values() if v)
+    total = len(bdf_map)
+    found = sum(1 for v in bdf_map.values() if v)
+    solver_label = "MSC Nastran (SUBCOM/SUBSEQ)" if solver == "msc" else "NX Nastran (LOAD kart)"
 
-    print("\n" + "=" * 60)
-    print("  Combination BDF Builder – Report")
-    print("=" * 60)
-    print(f"  Excel file   : {excel_path}")
-    print(f"  BDF root     : {bdf_root}")
-    print(f"  Output       : {output_path}")
-    print(f"  Combinations : {combos_written}")
-    print(f"  Unit cases   : {found_cases} / {total_cases} found")
+    print("\n" + "=" * 62)
+    print("  Combination BDF Builder – Rapor")
+    print("=" * 62)
+    print(f"  Excel       : {excel_path}")
+    print(f"  BDF kök     : {bdf_root}")
+    print(f"  Çıktı       : {output_path}")
+    print(f"  Solver      : {solver_label}")
+    print(f"  Kombinasyon : {combos_written}")
+    print(f"  Unit case   : {found} / {total} bulundu")
 
     if missing:
-        print(f"\n  [!] {len(missing)} unit case BDF(s) NOT FOUND:")
+        print(f"\n  [!] {len(missing)} BDF dosyası BULUNAMADI:")
         for cid in missing:
             print(f"      - {cid}")
     else:
-        print("\n  All unit case BDF files located successfully.")
+        print("\n  Tüm unit case BDF dosyaları başarıyla bulundu.")
 
-    print("=" * 60)
-
+    print("=" * 62)
     if not missing:
-        print(f"\n  Output written to: {output_path}\n")
+        print(f"\n  Çıktı yazıldı: {output_path}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -405,102 +660,112 @@ def print_report(
 def run_gui():
     try:
         import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk, scrolledtext
+        from tkinter import filedialog, messagebox, scrolledtext
     except ImportError:
-        sys.exit("tkinter is not available on this system.")
+        sys.exit("tkinter bu sistemde mevcut değil.")
 
     root = tk.Tk()
     root.title("Combination BDF Builder")
     root.resizable(True, True)
 
-    pad = {"padx": 6, "pady": 4}
+    pad = {"padx": 6, "pady": 3}
 
-    # ── Variables ──────────────────────────────────────────────────────────
-    var_excel = tk.StringVar()
+    # ── Değişkenler ──────────────────────────────────────────────────────────
+    var_excel    = tk.StringVar()
     var_bdf_root = tk.StringVar()
-    var_output = tk.StringVar()
-    var_fmt = tk.StringVar(value="wide")
-    var_sheet = tk.StringVar(value="0")
-    var_combo_col = tk.StringVar()
-    var_case_col = tk.StringVar()
+    var_output   = tk.StringVar()
+    var_solver   = tk.StringVar(value="nx")
+    var_fmt      = tk.StringVar(value="paired")
+    var_sheet    = tk.StringVar(value="0")
+    var_combo_col  = tk.StringVar()
+    var_case_col   = tk.StringVar()
     var_factor_col = tk.StringVar()
-    var_rel_paths = tk.BooleanVar(value=False)
-    var_filter = tk.StringVar()
+    var_rel_paths  = tk.BooleanVar(value=False)
+    var_filter     = tk.StringVar()
+    var_sc_sid     = tk.StringVar(value="1")
 
-    # ── Layout helpers ─────────────────────────────────────────────────────
+    # ── Yardımcılar ──────────────────────────────────────────────────────────
     def _row(parent, label, variable, browse_cmd=None, row=0):
         tk.Label(parent, text=label, anchor="w").grid(
             row=row, column=0, sticky="w", **pad
         )
-        e = tk.Entry(parent, textvariable=variable, width=60)
-        e.grid(row=row, column=1, sticky="ew", **pad)
+        tk.Entry(parent, textvariable=variable, width=58).grid(
+            row=row, column=1, sticky="ew", **pad
+        )
         if browse_cmd:
-            tk.Button(parent, text="Browse…", command=browse_cmd).grid(
+            tk.Button(parent, text="Gözat…", command=browse_cmd, width=8).grid(
                 row=row, column=2, **pad
             )
         return row + 1
 
     def browse_excel():
         p = filedialog.askopenfilename(
-            title="Select Combination Excel",
-            filetypes=[("Excel files", "*.xlsx *.xls *.xlsm"), ("All files", "*.*")],
+            title="Kombinasyon Excel'ini Seç",
+            filetypes=[("Excel", "*.xlsx *.xls *.xlsm"), ("Tümü", "*.*")],
         )
         if p:
             var_excel.set(p)
 
-    def browse_bdf_root():
-        p = filedialog.askdirectory(title="Select BDF Root Directory")
+    def browse_root():
+        p = filedialog.askdirectory(title="BDF Kök Dizinini Seç")
         if p:
             var_bdf_root.set(p)
 
     def browse_output():
         p = filedialog.asksaveasfilename(
-            title="Save Output BDF As",
+            title="Çıktı BDF Dosyasını Kaydet",
             defaultextension=".bdf",
-            filetypes=[("BDF files", "*.bdf"), ("All files", "*.*")],
+            filetypes=[("BDF", "*.bdf"), ("Tümü", "*.*")],
         )
         if p:
             var_output.set(p)
 
-    # ── Main frame ─────────────────────────────────────────────────────────
+    # ── Ana çerçeve ──────────────────────────────────────────────────────────
     main = tk.Frame(root)
-    main.pack(fill="both", expand=True, padx=10, pady=10)
+    main.pack(fill="both", expand=True, padx=10, pady=8)
     main.columnconfigure(1, weight=1)
 
     r = 0
-    r = _row(main, "Combination Excel:", var_excel, browse_excel, r)
-    r = _row(main, "Unit BDF Root Dir:", var_bdf_root, browse_bdf_root, r)
-    r = _row(main, "Output BDF File:", var_output, browse_output, r)
+    r = _row(main, "Kombinasyon Excel:", var_excel, browse_excel, r)
+    r = _row(main, "Unit BDF Kök Dizin:", var_bdf_root, browse_root, r)
+    r = _row(main, "Çıktı BDF Dosyası:", var_output, browse_output, r)
 
-    # Format selector
-    tk.Label(main, text="Excel Format:", anchor="w").grid(
-        row=r, column=0, sticky="w", **pad
-    )
-    fmt_frame = tk.Frame(main)
-    fmt_frame.grid(row=r, column=1, sticky="w", **pad)
-    tk.Radiobutton(fmt_frame, text="Wide", variable=var_fmt, value="wide").pack(side="left")
-    tk.Radiobutton(fmt_frame, text="Long", variable=var_fmt, value="long").pack(side="left", padx=10)
+    # Solver
+    tk.Label(main, text="Solver:", anchor="w").grid(row=r, column=0, sticky="w", **pad)
+    sf = tk.Frame(main); sf.grid(row=r, column=1, sticky="w", **pad)
+    tk.Radiobutton(sf, text="NX Nastran  (LOAD kart)", variable=var_solver, value="nx").pack(side="left")
+    tk.Radiobutton(sf, text="MSC Nastran  (SUBCOM/SUBSEQ)", variable=var_solver, value="msc").pack(side="left", padx=14)
     r += 1
 
-    r = _row(main, "Sheet (name or index):", var_sheet, None, r)
+    # Format
+    tk.Label(main, text="Excel Formatı:", anchor="w").grid(row=r, column=0, sticky="w", **pad)
+    ff = tk.Frame(main); ff.grid(row=r, column=1, sticky="w", **pad)
+    tk.Radiobutton(ff, text="Paired (önerilen)", variable=var_fmt, value="paired").pack(side="left")
+    tk.Radiobutton(ff, text="Wide", variable=var_fmt, value="wide").pack(side="left", padx=6)
+    tk.Radiobutton(ff, text="Long", variable=var_fmt, value="long").pack(side="left", padx=6)
+    r += 1
 
-    tk.Label(main, text="[Long format only]", fg="gray", anchor="w").grid(
+    r = _row(main, "Sayfa (ad veya indeks):", var_sheet, None, r)
+
+    tk.Label(main, text="[Yalnızca Long format]", fg="gray", anchor="w").grid(
         row=r, column=0, columnspan=3, sticky="w", padx=6
     )
     r += 1
-    r = _row(main, "  Combo column:", var_combo_col, None, r)
-    r = _row(main, "  Case ID column:", var_case_col, None, r)
-    r = _row(main, "  Factor column:", var_factor_col, None, r)
+    r = _row(main, "  Kombo sütunu:", var_combo_col, None, r)
+    r = _row(main, "  Case ID sütunu:", var_case_col, None, r)
+    r = _row(main, "  Katsayı sütunu:", var_factor_col, None, r)
 
-    tk.Checkbutton(main, text="Use relative paths in INCLUDE", variable=var_rel_paths).grid(
-        row=r, column=0, columnspan=2, sticky="w", **pad
-    )
+    r = _row(main, "[MSC] Başlangıç SUBCASE SID:", var_sc_sid, None, r)
+
+    tk.Checkbutton(
+        main, text="INCLUDE yollarını göreli yaz", variable=var_rel_paths
+    ).grid(row=r, column=0, columnspan=2, sticky="w", **pad)
     r += 1
 
-    r = _row(main, "Filter combos (comma-separated, blank=all):", var_filter, None, r)
+    r = _row(main, "Filtrele (virgülle ayrılmış, boş=hepsi):", var_filter, None, r)
 
-    # ── Log area ───────────────────────────────────────────────────────────
-    log = scrolledtext.ScrolledText(main, height=12, state="disabled", wrap="word")
+    # Log alanı
+    log = scrolledtext.ScrolledText(main, height=14, state="disabled", wrap="word")
     log.grid(row=r, column=0, columnspan=3, sticky="nsew", **pad)
     main.rowconfigure(r, weight=1)
     r += 1
@@ -511,18 +776,16 @@ def run_gui():
         log.see("end")
         log.configure(state="disabled")
 
-    # ── Run button ─────────────────────────────────────────────────────────
+    # Çalıştır
     def run():
-        log.configure(state="normal")
-        log.delete("1.0", "end")
-        log.configure(state="disabled")
-
-        excel = var_excel.get().strip()
+        log.configure(state="normal"); log.delete("1.0", "end"); log.configure(state="disabled")
+        excel   = var_excel.get().strip()
         bdf_root = var_bdf_root.get().strip()
-        output = var_output.get().strip()
+        output  = var_output.get().strip()
+        solver  = var_solver.get()
 
         if not excel or not bdf_root or not output:
-            messagebox.showerror("Error", "Excel, BDF root, and output path are required.")
+            messagebox.showerror("Hata", "Excel, BDF kök dizini ve çıktı yolu zorunludur.")
             return
 
         sheet_raw = var_sheet.get().strip()
@@ -531,55 +794,56 @@ def run_gui():
         except ValueError:
             sheet = sheet_raw
 
-        fmt = var_fmt.get()
-        combo_col = var_combo_col.get().strip()
-        case_col = var_case_col.get().strip()
-        factor_col = var_factor_col.get().strip()
-        rel = var_rel_paths.get()
+        fmt    = var_fmt.get()
         filter_raw = var_filter.get().strip()
         combo_filter = [x.strip() for x in filter_raw.split(",")] if filter_raw else None
+        try:
+            sc_sid = int(var_sc_sid.get().strip())
+        except ValueError:
+            sc_sid = 1
 
         try:
-            _log("Reading Excel…")
-            combinations = load_combinations(
-                excel, fmt, sheet, combo_col, case_col, factor_col
+            _log("Excel okunuyor…")
+            combs = load_combinations(
+                excel, fmt, sheet,
+                var_combo_col.get().strip(),
+                var_case_col.get().strip(),
+                var_factor_col.get().strip(),
             )
-            _log(f"  → {len(combinations)} combination(s) loaded.")
+            _log(f"  → {len(combs)} kombinasyon yüklendi.")
 
-            unique_cases = sorted(
-                {cid for cases in combinations.values() for cid in cases}
-            )
-            _log(f"  → {len(unique_cases)} unique unit case ID(s) found.")
+            unique_ids = sorted({cid for entries in combs.values() for _, cid, _ in entries})
+            _log(f"  → {len(unique_ids)} benzersiz unit case ID'si bulundu.")
 
-            _log("Searching for BDF files…")
-            bdf_map = find_bdf_files(bdf_root, unique_cases)
+            _log("BDF dosyaları aranıyor…")
+            bdf_map = find_bdf_files(bdf_root, unique_ids)
             found = sum(1 for v in bdf_map.values() if v)
-            _log(f"  → {found} / {len(unique_cases)} BDF file(s) located.")
+            _log(f"  → {found} / {len(unique_ids)} BDF bulundu.")
 
-            _log("Writing output BDF…")
-            combos_written, missing = write_combination_bdf(
-                output, combinations, bdf_map, rel, combo_filter
+            _log(f"Çıktı BDF yazılıyor ({solver.upper()})…")
+            n, missing = write_combination_bdf(
+                output, combs, bdf_map, solver, var_rel_paths.get(), combo_filter, sc_sid
             )
-            _log(f"  → {combos_written} combination(s) written.")
+            _log(f"  → {n} kombinasyon yazıldı.")
 
             if missing:
-                _log(f"\n[!] {len(missing)} BDF file(s) NOT FOUND:")
+                _log(f"\n[!] {len(missing)} BDF bulunamadı:")
                 for cid in missing:
                     _log(f"    - {cid}")
             else:
-                _log("\nAll unit case BDF files found.")
+                _log("\nTüm unit case BDF dosyaları bulundu.")
 
-            _log(f"\nDone!  Output: {output}")
-            messagebox.showinfo("Done", f"Output written to:\n{output}")
+            _log(f"\nTamamlandı!  Çıktı: {output}")
+            messagebox.showinfo("Tamamlandı", f"Çıktı yazıldı:\n{output}")
 
         except Exception as exc:
-            _log(f"\nERROR: {exc}")
-            messagebox.showerror("Error", str(exc))
+            _log(f"\nHATA: {exc}")
+            messagebox.showerror("Hata", str(exc))
 
-    btn_frame = tk.Frame(main)
-    btn_frame.grid(row=r, column=0, columnspan=3, pady=8)
-    tk.Button(btn_frame, text="Run", command=run, width=16, bg="#2a7ae2", fg="white").pack(side="left", padx=4)
-    tk.Button(btn_frame, text="Quit", command=root.destroy, width=10).pack(side="left", padx=4)
+    btn = tk.Frame(main)
+    btn.grid(row=r, column=0, columnspan=3, pady=8)
+    tk.Button(btn, text="Çalıştır", command=run, width=14, bg="#2a7ae2", fg="white").pack(side="left", padx=4)
+    tk.Button(btn, text="Çıkış",   command=root.destroy, width=10).pack(side="left", padx=4)
 
     root.mainloop()
 
@@ -593,25 +857,29 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--gui", action="store_true", help="Open graphical interface")
-    p.add_argument("--excel", help="Path to the combination Excel file")
-    p.add_argument("--bdf-root", help="Root directory to search for unit case BDF files")
-    p.add_argument("--output", help="Output BDF file path")
+    p.add_argument("--gui", action="store_true", help="Grafik arayüzü aç")
+    p.add_argument("--excel",    help="Kombinasyon Excel dosyası yolu")
+    p.add_argument("--bdf-root", help="Unit case BDF dosyalarının kök dizini")
+    p.add_argument("--output",   help="Çıktı BDF dosyası yolu")
     p.add_argument(
-        "--format", choices=["wide", "long"], default="wide",
-        help="Excel layout: 'wide' (default) or 'long'"
+        "--solver", choices=["nx", "msc"], default="nx",
+        help="Nastran solver: 'nx' (LOAD kart, varsayılan) veya 'msc' (SUBCOM/SUBSEQ)",
+    )
+    p.add_argument(
+        "--format", choices=["paired", "wide", "long"], default="paired",
+        help="Excel düzeni: 'paired' (varsayılan), 'wide' veya 'long'",
     )
     p.add_argument("--sheet", default="0",
-        help="Excel sheet name or 0-based index (default: 0)")
-    p.add_argument("--combo-col", default="", help="[Long] Combination name column header")
-    p.add_argument("--case-col", default="", help="[Long] Unit case ID column header")
-    p.add_argument("--factor-col", default="", help="[Long] Scale factor column header")
+        help="Excel sayfa adı veya 0 tabanlı indeks (varsayılan: 0)")
+    p.add_argument("--combo-col",  default="", help="[Long] Kombinasyon adı sütun başlığı")
+    p.add_argument("--case-col",   default="", help="[Long] Unit case ID sütun başlığı")
+    p.add_argument("--factor-col", default="", help="[Long] Katsayı sütun başlığı")
     p.add_argument("--relative-paths", action="store_true",
-        help="Write INCLUDE paths relative to the output BDF directory")
+        help="INCLUDE yollarını çıktı BDF dizinine göreli yaz")
     p.add_argument("--combo-filter", nargs="*",
-        help="Only process these combination names (space-separated)")
-    p.add_argument("--start-load-sid", type=int, default=10000,
-        help="Starting SID for combination LOAD entries (default: 10000)")
+        help="Yalnızca bu kombinasyonları işle (boşlukla ayrılmış)")
+    p.add_argument("--start-subcase-sid", type=int, default=1,
+        help="[MSC] Unit SUBCASE başlangıç SID'i (varsayılan: 1)")
     return p
 
 
@@ -623,17 +891,13 @@ def main():
         run_gui()
         return
 
-    # CLI mode – all three paths are required
     errors = []
-    if not args.excel:
-        errors.append("--excel is required")
-    if not args.bdf_root:
-        errors.append("--bdf-root is required")
-    if not args.output:
-        errors.append("--output is required")
+    if not args.excel:    errors.append("--excel gerekli")
+    if not args.bdf_root: errors.append("--bdf-root gerekli")
+    if not args.output:   errors.append("--output gerekli")
     if errors:
         for e in errors:
-            print(f"[ERROR] {e}", file=sys.stderr)
+            print(f"[HATA] {e}", file=sys.stderr)
         parser.print_usage(sys.stderr)
         sys.exit(1)
 
@@ -643,45 +907,33 @@ def main():
     except ValueError:
         sheet = sheet_raw
 
-    print(f"Reading Excel: {args.excel}")
+    print(f"Excel okunuyor: {args.excel}")
     combinations = load_combinations(
-        args.excel,
-        args.format,
-        sheet,
-        args.combo_col,
-        args.case_col,
-        args.factor_col,
+        args.excel, args.format, sheet,
+        args.combo_col, args.case_col, args.factor_col,
     )
-    print(f"  → {len(combinations)} combination(s) loaded.")
+    print(f"  → {len(combinations)} kombinasyon yüklendi.")
 
-    unique_cases = sorted(
-        {cid for cases in combinations.values() for cid in cases}
-    )
-    print(f"  → {len(unique_cases)} unique unit case ID(s): {unique_cases[:10]}{'…' if len(unique_cases) > 10 else ''}")
+    unique_ids = sorted({cid for entries in combinations.values() for _, cid, _ in entries})
+    preview = unique_ids[:8]
+    print(f"  → {len(unique_ids)} unique unit case ID: {preview}{'…' if len(unique_ids) > 8 else ''}")
 
-    print(f"\nSearching for BDF files under: {args.bdf_root}")
-    bdf_map = find_bdf_files(args.bdf_root, unique_cases)
+    print(f"\nBDF dosyaları aranıyor: {args.bdf_root}")
+    bdf_map = find_bdf_files(args.bdf_root, unique_ids)
     found = sum(1 for v in bdf_map.values() if v)
-    print(f"  → {found} / {len(unique_cases)} found.")
+    print(f"  → {found} / {len(unique_ids)} bulundu.")
 
-    print(f"\nWriting output BDF: {args.output}")
+    solver_label = "MSC Nastran (SUBCOM/SUBSEQ)" if args.solver == "msc" else "NX Nastran (LOAD kart)"
+    print(f"\nÇıktı BDF yazılıyor [{solver_label}]: {args.output}")
     combos_written, missing = write_combination_bdf(
-        args.output,
-        combinations,
-        bdf_map,
-        args.relative_paths,
-        args.combo_filter,
-        args.start_load_sid,
+        args.output, combinations, bdf_map,
+        args.solver, args.relative_paths,
+        args.combo_filter, args.start_subcase_sid,
     )
 
     print_report(
-        args.excel,
-        args.bdf_root,
-        args.output,
-        combinations,
-        bdf_map,
-        missing,
-        combos_written,
+        args.excel, args.bdf_root, args.output,
+        args.solver, combinations, bdf_map, missing, combos_written,
     )
 
     sys.exit(1 if missing else 0)
